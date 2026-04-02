@@ -1,0 +1,18 @@
+{
+  "name": "coah",
+  "version": "1.0.0",
+  "description": "coahGPT - AI assistant powered by vibes and an RTX 3060",
+  "bin": {
+    "coah": "./bin/run.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "keywords": ["ai", "cli", "coah", "gpt", "cat"],
+  "author": "coah",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/coah80/coahgpt"
+  }
+}
