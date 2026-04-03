@@ -1,6 +1,6 @@
 # The Dumbest April Fools Joke Ever&#8482;
 
-coahGPT was a self-hosted AI chat app that ran on [Ollama](https://ollama.com). it had accounts and email verification and a CLI and an openai-compatible API and a whole persona system. it launched, got like 4 users, and then on april 1st we put up a fake "shutting down due to overwhelming demand" page. comedy gold.
+coahGPT was a self-hosted AI chat app that ran on [Ollama](https://ollama.com). it had accounts and email verification and a CLI and an openai-compatible API and a whole persona system. it launched, got like 4 users, and then on april 3rd we put up a fake "shutting down due to overwhelming demand" page. not even on april fools. just a random thursday. comedy gold.
 
 anyway heres how to actually run it yourself.
 
