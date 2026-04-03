@@ -12,7 +12,7 @@ import (
 
 const (
 	DefaultBaseURL = "http://localhost:11434"
-	Model          = "coahgpt-one"
+	Model          = "qwen3:8b"
 )
 
 type Message struct {
@@ -21,9 +21,10 @@ type Message struct {
 }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model    string                 `json:"model"`
+	Messages []Message              `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Options  map[string]interface{} `json:"options,omitempty"`
 }
 
 type chatStreamChunk struct {
@@ -53,6 +54,12 @@ func (c *Client) StreamChat(ctx context.Context, messages []Message, onToken fun
 		Model:    Model,
 		Messages: messages,
 		Stream:   true,
+		Options: map[string]interface{}{
+			"repeat_penalty":    1.3,
+			"temperature":      0.7,
+			"top_p":            0.9,
+			"num_predict":      1024,
+		},
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)

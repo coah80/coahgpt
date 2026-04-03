@@ -1,16 +1,185 @@
 <script lang="ts">
-  import CyclingText from '$lib/components/CyclingText.svelte';
+  import { onMount, tick } from 'svelte';
+  import type { Conversation, Message, StreamToken } from '$lib/types.js';
+  import {
+    loadConversations,
+    createConversation,
+    addMessage,
+    updateLastAssistantMessage,
+    removeConversation,
+    upsertConversation,
+    saveConversations,
+  } from '$lib/chat-store.js';
+  import Sidebar from '$lib/components/Sidebar.svelte';
+  import MessageBubble from '$lib/components/MessageBubble.svelte';
   import CatLogo from '$lib/components/CatLogo.svelte';
+  import PurpleCat from '$lib/components/PurpleCat.svelte';
+  import CyclingText from '$lib/components/CyclingText.svelte';
 
-  let copied = $state(false);
-  const installCmd = 'curl -fsSL https://coahgpt.com/install.sh | bash';
+  let conversations = $state<ReadonlyArray<Conversation>>([]);
+  let activeId = $state<string | null>(null);
+  let input = $state('');
+  let streaming = $state(false);
+  let sessionId = $state<string | null>(null);
+  let sidebarCollapsed = $state(true);
+  let messagesEnd: HTMLDivElement | undefined = $state();
+  let textareaEl: HTMLTextAreaElement | undefined = $state();
 
-  function copyInstall() {
-    navigator.clipboard.writeText(installCmd);
-    copied = true;
-    setTimeout(() => {
-      copied = false;
-    }, 2000);
+  const activeConversation = $derived(
+    conversations.find((c) => c.id === activeId) ?? null
+  );
+  const messages = $derived(activeConversation?.messages ?? []);
+
+  onMount(() => {
+    conversations = loadConversations();
+  });
+
+  function generateId(): string {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  function scrollToBottom() {
+    tick().then(() => {
+      messagesEnd?.scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+
+  function newChat() {
+    const conv = createConversation(generateId());
+    conversations = [conv, ...conversations];
+    activeId = conv.id;
+    sessionId = null;
+    input = '';
+    sidebarCollapsed = true;
+    saveConversations(conversations);
+  }
+
+  function selectChat(id: string) {
+    activeId = id;
+    sessionId = null;
+    sidebarCollapsed = true;
+    scrollToBottom();
+  }
+
+  function deleteChat(id: string) {
+    conversations = removeConversation(conversations, id);
+    if (activeId === id) {
+      activeId = conversations.length > 0 ? conversations[0].id : null;
+      sessionId = null;
+    }
+    saveConversations(conversations);
+  }
+
+  async function sendMessage() {
+    const text = input.trim();
+    if (!text || streaming) return;
+
+    if (!activeId) {
+      newChat();
+    }
+
+    const userMsg: Message = {
+      id: generateId(),
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
+    };
+
+    let conv = activeConversation!;
+    conv = addMessage(conv, userMsg);
+    conversations = upsertConversation(conversations, conv);
+    saveConversations(conversations);
+    input = '';
+    resizeTextarea();
+    scrollToBottom();
+
+    const assistantMsg: Message = {
+      id: generateId(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+    };
+    conv = addMessage(conv, assistantMsg);
+    conversations = upsertConversation(conversations, conv);
+
+    streaming = true;
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId ?? '',
+          message: text,
+        }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        conv = updateLastAssistantMessage(conv, '[error: failed to connect]');
+        conversations = upsertConversation(conversations, conv);
+        streaming = false;
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let content = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const json = line.slice(6).trim();
+          if (!json) continue;
+
+          try {
+            const event: StreamToken & { thinking?: string } = JSON.parse(json);
+
+            if (event.token) {
+              content += event.token;
+              conv = updateLastAssistantMessage(conv, content);
+              conversations = upsertConversation(conversations, conv);
+              scrollToBottom();
+            }
+
+            if (event.session_id) {
+              sessionId = event.session_id;
+            }
+
+            if (event.done) break;
+          } catch {
+            // malformed chunk, skip
+          }
+        }
+      }
+    } catch {
+      conv = updateLastAssistantMessage(conv, conv.messages.at(-1)?.content + '\n\n[connection lost]');
+      conversations = upsertConversation(conversations, conv);
+    }
+
+    streaming = false;
+    saveConversations(conversations);
+    scrollToBottom();
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function resizeTextarea() {
+    if (!textareaEl) return;
+    textareaEl.style.height = 'auto';
+    textareaEl.style.height = Math.min(textareaEl.scrollHeight, 200) + 'px';
   }
 </script>
 
@@ -21,705 +190,274 @@
   />
 </svelte:head>
 
-<div class="landing">
-  <!-- ═══════════════ Nav ═══════════════ -->
-  <nav class="nav">
-    <div class="nav-inner">
-      <div class="nav-logo" style="display: flex; align-items: center; gap: 0.5rem;"><CatLogo size={28} tooltipPosition="bottom" /> <a href="/">coahGPT</a></div>
-      <div class="nav-links">
-        <a
-          href="https://github.com/coah80/coahgpt"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="nav-link"
-        >
-          GitHub
-        </a>
-        <a href="/login" class="nav-link">Sign in</a>
-        <a href="/login" class="nav-cta">Try it</a>
-      </div>
-    </div>
-  </nav>
+<div class="app">
+  <Sidebar
+    {conversations}
+    {activeId}
+    collapsed={sidebarCollapsed}
+    onNewChat={newChat}
+    onSelectChat={selectChat}
+    onDeleteChat={deleteChat}
+    onToggleCollapse={() => { sidebarCollapsed = !sidebarCollapsed; }}
+  />
 
-  <!-- ═══════════════ Hero ═══════════════ -->
-  <section class="hero">
-    <div class="hero-content">
-      <!-- Pill badge -->
-      <div class="badge">
-        <span class="badge-dot"></span>
-        Powered by vibes and an RTX 3060
-      </div>
+  <main class="main">
+    <!-- Header -->
+    <header class="header">
+      <button
+        class="menu-btn"
+        onclick={() => { sidebarCollapsed = !sidebarCollapsed; }}
+        aria-label="Toggle sidebar"
+      >
+        <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+        </svg>
+      </button>
+      <CatLogo size={28} tooltipPosition="bottom" />
+      <h1 class="title">coahGPT</h1>
+    </header>
 
-      <!-- Main heading -->
-      <h1 class="hero-heading">
-        <span class="hero-heading-prefix">Built for</span>
-        <CyclingText />
-      </h1>
-
-      <!-- Subtitle -->
-      <p class="hero-subtitle">
-        Work with coah directly in your codebase. Build, debug, and ship from your terminal.
-      </p>
-
-      <!-- Install command box -->
-      <div class="install-box">
-        <div class="install-label">
-          Get coah code
-          <svg class="install-chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2.5"
-              d="M19 9l-7 7-7-7"
-            />
-          </svg>
+    <!-- Messages -->
+    <div class="messages">
+      {#if messages.length === 0}
+        <div class="empty-state">
+          <PurpleCat size={100} glow={true} />
+          <h2 class="empty-title">
+            built for <CyclingText />
+          </h2>
+          <p class="empty-sub">ask anything, no account needed</p>
         </div>
-        <div class="install-divider"></div>
-        <code class="install-cmd">
-          <span class="token-cmd">curl</span>
-          <span class="token-flag"> -fsSL</span>
-          <span class="token-url"> https://coahgpt.com/install.sh</span>
-          <span class="token-pipe"> |</span>
-          <span class="token-cmd"> bash</span>
-        </code>
-        <div class="install-divider"></div>
-        <button onclick={copyInstall} class="install-copy" aria-label="Copy install command">
-          {#if copied}
-            <svg class="copy-icon copy-check" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M5 13l4 4L19 7"
-              />
+      {:else}
+        <div class="messages-inner">
+          {#each messages as msg (msg.id)}
+            <MessageBubble
+              role={msg.role}
+              content={msg.content}
+              streaming={streaming && msg.id === messages.at(-1)?.id && msg.role === 'assistant'}
+            />
+          {/each}
+          <div bind:this={messagesEnd}></div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Input -->
+    <div class="input-area">
+      <div class="input-wrapper">
+        <textarea
+          bind:this={textareaEl}
+          bind:value={input}
+          oninput={resizeTextarea}
+          onkeydown={handleKeydown}
+          placeholder="message coahGPT..."
+          rows="1"
+          disabled={streaming}
+          class="input-field"
+        ></textarea>
+        <button
+          onclick={sendMessage}
+          disabled={streaming || !input.trim()}
+          class="send-btn"
+          aria-label="Send"
+        >
+          {#if streaming}
+            <svg class="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <path stroke-linecap="round" stroke-width="2" d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83" />
             </svg>
           {:else}
-            <svg class="copy-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" stroke-width="2" />
-              <path stroke-width="2" d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7" />
             </svg>
           {/if}
         </button>
       </div>
-
-      <!-- CTA button -->
-      <a href="/login" class="hero-cta">
-        Try it now in the browser
-        <svg class="cta-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M17 8l4 4m0 0l-4 4m4-4H3"
-          />
-        </svg>
-      </a>
-
-      <!-- coah code callout -->
-      <div class="callout">
-        <span class="callout-badge">NEW!!</span>
-        <span class="callout-name">coah code</span>
-        <span class="callout-tagline">claude code but terrible.</span>
-      </div>
+      <p class="disclaimer">runs on ollama locally. no data leaves your machine.</p>
     </div>
-  </section>
-
-  <!-- ═══════════════ Cat Section ═══════════════ -->
-  <section class="cat-section">
-    <div class="cat-float">
-      <CatLogo size={80} />
-    </div>
-    <p class="cat-caption">meow (translation: i am sentient)</p>
-  </section>
-
-  <!-- ═══════════════ Feature Cards ═══════════════ -->
-  <section class="features">
-    <div class="features-grid">
-      <!-- Code Assistant -->
-      <div class="feature-card">
-        <div class="feature-icon feature-icon-mauve">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"
-            />
-          </svg>
-        </div>
-        <h3 class="feature-title">Code Assistant</h3>
-        <p class="feature-desc">
-          Writes code that actually works (sometimes). Supports every language you've heard of and
-          several you haven't.
-        </p>
-      </div>
-
-      <!-- Deep Research -->
-      <div class="feature-card">
-        <div class="feature-icon feature-icon-lavender">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-            />
-          </svg>
-        </div>
-        <h3 class="feature-title">Deep Research</h3>
-        <p class="feature-desc">
-          Googles things so you don't have to. Synthesizes entire Stack Overflow threads into one
-          coherent answer.
-        </p>
-      </div>
-
-      <!-- Self-Hosted -->
-      <div class="feature-card">
-        <div class="feature-icon feature-icon-green">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"
-            />
-          </svg>
-        </div>
-        <h3 class="feature-title">Self-Hosted</h3>
-        <p class="feature-desc">
-          Running on bare metal, not some soulless cloud. Your data stays on hardware you can
-          physically kick.
-        </p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════ Footer ═══════════════ -->
-  <footer class="site-footer">
-    <div class="footer-inner">
-      <p>Made with 💜 and an RTX 3060 by coah</p>
-      <p>&copy; 2026 coahGPT Inc. (not actually incorporated)</p>
-    </div>
-  </footer>
+  </main>
 </div>
 
 <style>
-  /* ───────── Layout ───────── */
-  .landing {
-    min-height: 100vh;
+  .app {
     display: flex;
-    flex-direction: column;
-    background: var(--color-base);
-    position: relative;
-    overflow-x: hidden;
-  }
-
-  .landing::before {
-    content: '';
-    position: absolute;
-    top: -40%;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 140%;
-    height: 80%;
-    background: radial-gradient(
-      ellipse at center,
-      color-mix(in srgb, var(--color-mauve) 8%, transparent) 0%,
-      color-mix(in srgb, var(--color-lavender) 4%, transparent) 30%,
-      transparent 70%
-    );
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  /* ───────── Nav ───────── */
-  .nav {
-    position: sticky;
-    top: 0;
-    z-index: 50;
-    border-bottom: 1px solid color-mix(in srgb, var(--color-surface0) 40%, transparent);
-    background: color-mix(in srgb, var(--color-base) 80%, transparent);
-    backdrop-filter: blur(20px) saturate(1.8);
-    -webkit-backdrop-filter: blur(20px) saturate(1.8);
-  }
-
-  .nav-inner {
-    max-width: 72rem;
-    margin: 0 auto;
-    padding: 0 1.5rem;
-    height: 4rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .nav-logo {
-    font-size: 1.25rem;
-    font-weight: 800;
-    color: var(--color-mauve);
-    text-decoration: none;
-    letter-spacing: -0.02em;
-  }
-
-  .nav-links {
-    display: flex;
-    align-items: center;
-    gap: 1.25rem;
-  }
-
-  .nav-link {
-    font-size: 0.875rem;
-    color: var(--color-subtext0);
-    text-decoration: none;
-    transition: color 0.2s;
-  }
-
-  .nav-link:hover {
-    color: var(--color-text);
-  }
-
-  .nav-cta {
-    padding: 0.5rem 1.25rem;
-    border-radius: 0.625rem;
-    background: var(--color-mauve);
-    color: var(--color-crust);
-    font-size: 0.875rem;
-    font-weight: 600;
-    text-decoration: none;
-    transition: opacity 0.2s;
-  }
-
-  .nav-cta:hover {
-    opacity: 0.9;
-  }
-
-  /* ───────── Hero ───────── */
-  .hero {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 6rem 1.5rem 4rem;
-    position: relative;
-    z-index: 1;
-  }
-
-  .hero-content {
-    max-width: 52rem;
-    margin: 0 auto;
-    text-align: center;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0;
-  }
-
-  /* Badge */
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.375rem 1rem;
-    border-radius: 9999px;
-    background: color-mix(in srgb, var(--color-surface0) 50%, transparent);
-    border: 1px solid color-mix(in srgb, var(--color-surface1) 40%, transparent);
-    font-size: 0.8125rem;
-    color: var(--color-subtext0);
-    margin-bottom: 2.5rem;
-  }
-
-  .badge-dot {
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 50%;
-    background: var(--color-green);
-    animation: pulse-dot 2s ease-in-out infinite;
-  }
-
-  @keyframes pulse-dot {
-    0%,
-    100% {
-      opacity: 1;
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-green) 40%, transparent);
-    }
-    50% {
-      opacity: 0.7;
-      box-shadow: 0 0 0 6px transparent;
-    }
-  }
-
-  /* Heading */
-  .hero-heading {
-    font-family: 'Playfair Display', Georgia, 'Times New Roman', serif;
-    font-size: clamp(3rem, 8vw, 5.5rem);
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    line-height: 1.1;
-    color: var(--color-text);
-    margin: 0 0 1.5rem;
-  }
-
-  .hero-heading-prefix {
-    color: var(--color-text);
-  }
-
-  /* Subtitle */
-  .hero-subtitle {
-    font-size: 1.25rem;
-    line-height: 1.7;
-    color: var(--color-subtext0);
-    max-width: 36rem;
-    margin: 0 0 2.5rem;
-  }
-
-  /* ───────── Install Box ───────── */
-  .install-box {
-    display: inline-flex;
-    align-items: stretch;
-    background: var(--color-crust);
-    border: 1px solid var(--color-surface0);
-    border-radius: 1rem;
+    height: 100vh;
     overflow: hidden;
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--color-surface0) 30%, transparent),
-      0 4px 24px color-mix(in srgb, #000 30%, transparent),
-      0 1px 3px color-mix(in srgb, #000 20%, transparent);
-    max-width: 100%;
-    margin-bottom: 1.75rem;
   }
 
-  .install-label {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.875rem 1.25rem;
-    background: var(--color-text);
-    color: var(--color-crust);
-    font-weight: 600;
-    font-size: 0.875rem;
-    white-space: nowrap;
-    cursor: default;
-    user-select: none;
-  }
-
-  .install-chevron {
-    width: 0.75rem;
-    height: 0.75rem;
-    opacity: 0.5;
-  }
-
-  .install-divider {
-    width: 1px;
-    background: var(--color-surface0);
-  }
-
-  .install-cmd {
+  .main {
     flex: 1;
-    padding: 0.875rem 1.25rem;
-    font-family: var(--font-mono);
-    font-size: 0.9375rem;
-    white-space: nowrap;
-    user-select: all;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--color-base);
+  }
+
+  .header {
     display: flex;
     align-items: center;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-surface0) 40%, transparent);
+    background: var(--color-base);
+    flex-shrink: 0;
   }
 
-  .token-cmd {
-    color: var(--color-mauve);
-    font-weight: 600;
-  }
-
-  .token-flag {
-    color: var(--color-peach);
-  }
-
-  .token-url {
-    color: var(--color-text);
-  }
-
-  .token-pipe {
-    color: var(--color-overlay0);
-  }
-
-  .install-copy {
+  .menu-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 0.875rem 1rem;
-    background: transparent;
-    border: none;
+    padding: 0.375rem;
+    border-radius: 0.375rem;
     color: var(--color-subtext0);
+    background: none;
+    border: none;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: all 0.15s;
   }
 
-  .install-copy:hover {
+  .menu-btn:hover {
     color: var(--color-text);
     background: color-mix(in srgb, var(--color-surface0) 40%, transparent);
   }
 
-  .copy-icon {
-    width: 1.125rem;
-    height: 1.125rem;
+  .title {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.125rem;
+    font-weight: 800;
+    color: var(--color-mauve);
+    margin: 0;
   }
 
-  .copy-check {
-    color: var(--color-green);
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
 
-  /* ───────── CTA Button ───────── */
-  .hero-cta {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.625rem;
-    padding: 0.875rem 2rem;
-    border-radius: 0.875rem;
-    background: var(--color-mauve);
-    color: var(--color-crust);
-    font-weight: 600;
-    font-size: 1.0625rem;
-    text-decoration: none;
-    transition: all 0.25s;
-    box-shadow: 0 2px 12px color-mix(in srgb, var(--color-mauve) 30%, transparent);
-    margin-bottom: 2rem;
-  }
-
-  .hero-cta:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 20px color-mix(in srgb, var(--color-mauve) 40%, transparent);
-    opacity: 0.95;
-  }
-
-  .cta-arrow {
-    width: 1.125rem;
-    height: 1.125rem;
-    transition: transform 0.25s;
-  }
-
-  .hero-cta:hover .cta-arrow {
-    transform: translateX(3px);
-  }
-
-  /* ───────── Callout ───────── */
-  .callout {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.25rem;
-  }
-
-  .callout-badge {
-    font-size: 0.6875rem;
-    font-weight: 700;
-    color: var(--color-green);
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-  }
-
-  .callout-name {
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: var(--color-text);
-  }
-
-  .callout-tagline {
-    font-size: 0.875rem;
-    color: var(--color-subtext0);
-    font-style: italic;
-  }
-
-  /* ───────── Cat Section ───────── */
-  .cat-section {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 2rem 1.5rem 5rem;
-    position: relative;
-    z-index: 1;
-  }
-
-  .cat-float {
-    animation: float 4s ease-in-out infinite;
-  }
-
-  @keyframes float {
-    0%,
-    100% {
-      transform: translateY(0);
-    }
-    50% {
-      transform: translateY(-12px);
-    }
-  }
-
-  .cat-caption {
-    margin-top: 1.25rem;
-    font-size: 0.875rem;
-    color: var(--color-overlay0);
-    font-style: italic;
-  }
-
-  /* ───────── Feature Cards ───────── */
-  .features {
-    padding: 0 1.5rem 6rem;
-    position: relative;
-    z-index: 1;
-  }
-
-  .features-grid {
-    max-width: 64rem;
+  .messages-inner {
+    max-width: 768px;
     margin: 0 auto;
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 1.5rem;
+    padding: 1.5rem 1rem;
   }
 
-  .feature-card {
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 1.25rem;
     padding: 2rem;
-    border-radius: 1.25rem;
-    background: color-mix(in srgb, var(--color-mantle) 60%, transparent);
-    border: 1px solid color-mix(in srgb, var(--color-surface0) 40%, transparent);
-    transition: all 0.3s;
+    opacity: 0.9;
   }
 
-  .feature-card:hover {
-    border-color: color-mix(in srgb, var(--color-mauve) 25%, transparent);
-    transform: translateY(-2px);
-    box-shadow: 0 8px 32px color-mix(in srgb, #000 20%, transparent);
+  .empty-title {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.5rem;
+    font-weight: 800;
+    color: var(--color-text);
+    margin: 0;
+    text-align: center;
   }
 
-  .feature-icon {
-    width: 2.75rem;
-    height: 2.75rem;
-    border-radius: 0.75rem;
+  .empty-sub {
+    color: var(--color-overlay0);
+    font-size: 0.875rem;
+    margin: 0;
+  }
+
+  .input-area {
+    padding: 0.75rem 1rem 1rem;
+    background: var(--color-base);
+    flex-shrink: 0;
+  }
+
+  .input-wrapper {
+    max-width: 768px;
+    margin: 0 auto;
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+    background: color-mix(in srgb, var(--color-surface0) 50%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-surface1) 40%, transparent);
+    border-radius: 1rem;
+    padding: 0.5rem 0.5rem 0.5rem 1rem;
+    transition: border-color 0.15s;
+  }
+
+  .input-wrapper:focus-within {
+    border-color: color-mix(in srgb, var(--color-mauve) 40%, transparent);
+  }
+
+  .input-field {
+    flex: 1;
+    resize: none;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: 0.9375rem;
+    line-height: 1.5;
+    padding: 0.25rem 0;
+    max-height: 200px;
+  }
+
+  .input-field::placeholder {
+    color: var(--color-overlay0);
+  }
+
+  .input-field:disabled {
+    opacity: 0.5;
+  }
+
+  .send-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    margin-bottom: 1.25rem;
-    transition: background 0.3s;
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: 0.625rem;
+    background: var(--color-mauve);
+    color: var(--color-crust);
+    border: none;
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
   }
 
-  .feature-icon svg {
-    width: 1.375rem;
-    height: 1.375rem;
+  .send-btn:hover:not(:disabled) {
+    filter: brightness(1.1);
   }
 
-  .feature-icon-mauve {
-    background: color-mix(in srgb, var(--color-mauve) 12%, transparent);
-    color: var(--color-mauve);
+  .send-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
-  .feature-card:hover .feature-icon-mauve {
-    background: color-mix(in srgb, var(--color-mauve) 20%, transparent);
+  .spin {
+    animation: spin 1s linear infinite;
   }
 
-  .feature-icon-lavender {
-    background: color-mix(in srgb, var(--color-lavender) 12%, transparent);
-    color: var(--color-lavender);
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 
-  .feature-card:hover .feature-icon-lavender {
-    background: color-mix(in srgb, var(--color-lavender) 20%, transparent);
+  .disclaimer {
+    max-width: 768px;
+    margin: 0.5rem auto 0;
+    text-align: center;
+    font-size: 0.7rem;
+    color: var(--color-surface2);
   }
 
-  .feature-icon-green {
-    background: color-mix(in srgb, var(--color-green) 12%, transparent);
-    color: var(--color-green);
-  }
-
-  .feature-card:hover .feature-icon-green {
-    background: color-mix(in srgb, var(--color-green) 20%, transparent);
-  }
-
-  .feature-title {
-    font-size: 1.125rem;
-    font-weight: 600;
-    color: var(--color-text);
-    margin: 0 0 0.625rem;
-  }
-
-  .feature-desc {
-    font-size: 0.9375rem;
-    line-height: 1.6;
-    color: var(--color-subtext0);
-    margin: 0;
-  }
-
-  /* ───────── Footer ───────── */
-  .site-footer {
-    border-top: 1px solid color-mix(in srgb, var(--color-surface0) 40%, transparent);
-    padding: 2rem 1.5rem;
-    position: relative;
-    z-index: 1;
-  }
-
-  .footer-inner {
-    max-width: 64rem;
-    margin: 0 auto;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 0.875rem;
-    color: var(--color-overlay0);
-  }
-
-  .footer-inner p {
-    margin: 0;
-  }
-
-  /* ───────── Responsive ───────── */
-  @media (max-width: 768px) {
-    .hero {
-      padding: 4rem 1.5rem 3rem;
+  @media (max-width: 640px) {
+    .messages-inner {
+      padding: 1rem 0.75rem;
     }
 
-    .hero-heading {
-      font-size: clamp(2.25rem, 10vw, 3.5rem);
-    }
-
-    .hero-subtitle {
-      font-size: 1.0625rem;
-    }
-
-    .install-box {
-      flex-direction: column;
-      align-items: stretch;
-      border-radius: 0.875rem;
-      width: 100%;
-      max-width: 24rem;
-    }
-
-    .install-label {
-      justify-content: center;
-      padding: 0.75rem 1rem;
-    }
-
-    .install-divider {
-      width: auto;
-      height: 1px;
-    }
-
-    .install-cmd {
-      padding: 0.75rem 1rem;
-      font-size: 0.8125rem;
-      overflow-x: auto;
-    }
-
-    .install-copy {
-      padding: 0.75rem 1rem;
-      justify-content: center;
-    }
-
-    .features-grid {
-      grid-template-columns: 1fr;
-      max-width: 28rem;
-    }
-
-    .footer-inner {
-      flex-direction: column;
-      gap: 0.5rem;
-      text-align: center;
+    .empty-title {
+      font-size: 1.25rem;
     }
   }
 </style>

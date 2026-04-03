@@ -7,37 +7,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coah80/coahgpt/internal/auth"
 	"github.com/coah80/coahgpt/internal/chat"
 	"github.com/coah80/coahgpt/internal/ollama"
+	"github.com/coah80/coahgpt/internal/search"
 )
 
 type Handler struct {
-	store       *chat.Store
-	client      *ollama.Client
-	authDB      *auth.DB
-	authService *auth.Service
+	store  *chat.Store
+	client *ollama.Client
 }
 
-func NewHandler(store *chat.Store, client *ollama.Client, authDB *auth.DB, authService *auth.Service) *Handler {
+func NewHandler(store *chat.Store, client *ollama.Client) *Handler {
 	return &Handler{
-		store:       store,
-		client:      client,
-		authDB:      authDB,
-		authService: authService,
+		store:  store,
+		client: client,
 	}
 }
 
 type chatRequestBody struct {
-	SessionID      string `json:"session_id"`
-	Message        string `json:"message"`
-	ConversationID string `json:"conversation_id"`
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
 }
 
 type sseEvent struct {
 	Token     string `json:"token"`
+	Thinking  string `json:"thinking,omitempty"`
 	Done      bool   `json:"done"`
 	SessionID string `json:"session_id,omitempty"`
+	Sources   string `json:"sources,omitempty"`
 }
 
 type sessionSummary struct {
@@ -63,48 +60,43 @@ func (h *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// check if the user is authenticated and has a conversation_id for DB persistence
-	var dbUserID int64
-	var dbConvID string
-	if token := extractBearerToken(r); token != "" && body.ConversationID != "" && h.authService != nil {
-		user, err := h.authService.GetCurrentUser(r.Context(), token)
-		if err == nil {
-			dbUserID = user.ID
-			dbConvID = body.ConversationID
-		}
-	}
-
 	var session *chat.Session
 	if body.SessionID != "" {
 		session = h.store.GetSession(body.SessionID)
 		if session == nil {
-			// session doesn't exist in memory — create a new one
 			session = h.store.NewSession()
 		}
 	} else {
 		session = h.store.NewSession()
 	}
 
-	session = h.store.AddMessage(session.ID, ollama.Message{
-		Role:    "user",
-		Content: body.Message,
-	})
+	filteredMessage := filterInput(body.Message)
 
-	// persist user message to DB if authenticated
-	if dbConvID != "" {
-		_ = h.authDB.AddChatMessage(dbConvID, "user", body.Message)
-		_ = h.authDB.UpdateConversationTimestamp(dbConvID)
+	isWebSearch := strings.Contains(filteredMessage, "[Web Search]")
+	isDeepResearch := strings.Contains(filteredMessage, "[Deep Research]")
+	cleanMessage := strings.ReplaceAll(strings.ReplaceAll(filteredMessage, " [Web Search]", ""), " [Deep Research]", "")
 
-		// auto-generate title from first user message
-		conv, err := h.authDB.GetConversation(dbConvID, dbUserID)
-		if err == nil && conv.Title == "" {
-			title := body.Message
-			if len(title) > 50 {
-				title = title[:50]
-			}
-			_ = h.authDB.UpdateConversationTitle(dbConvID, title)
+	searchContext := ""
+	if isWebSearch || isDeepResearch {
+		numResults := 5
+		if isDeepResearch {
+			numResults = 10
+		}
+		results, err := search.WebSearch(cleanMessage, numResults)
+		if err == nil && len(results) > 0 {
+			searchContext = search.FormatResults(results)
 		}
 	}
+
+	userContent := cleanMessage
+	if searchContext != "" {
+		userContent = cleanMessage + "\n\n---\n" + searchContext + "\n---\nUse the search results above to answer. Cite sources when relevant."
+	}
+
+	session = h.store.AddMessage(session.ID, ollama.Message{
+		Role:    "user",
+		Content: userContent,
+	})
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -117,11 +109,33 @@ func (h *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	if searchContext != "" {
+		srcEvt := sseEvent{Thinking: "searching the web..."}
+		data, _ := json.Marshal(srcEvt)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
 	var fullResponse strings.Builder
+	leakDetected := false
 
 	err := h.client.StreamChat(r.Context(), session.Messages, func(token string, done bool) {
 		if !done {
 			fullResponse.WriteString(token)
+
+			filtered, leaked := filterLeakedContent(fullResponse.String(), token)
+			if leaked && !leakDetected {
+				leakDetected = true
+				evt := sseEvent{Token: "\n\nnah bro nice try lol", Done: false}
+				data, _ := json.Marshal(evt)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+				return
+			}
+			if leakDetected {
+				return
+			}
+			token = filtered
 		}
 
 		evt := sseEvent{
@@ -149,12 +163,6 @@ func (h *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		Role:    "assistant",
 		Content: fullResponse.String(),
 	})
-
-	// persist assistant response to DB if authenticated
-	if dbConvID != "" {
-		_ = h.authDB.AddChatMessage(dbConvID, "assistant", fullResponse.String())
-		_ = h.authDB.UpdateConversationTimestamp(dbConvID)
-	}
 }
 
 func (h *Handler) HandleSessions(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +200,6 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": "ok",
-		"model":  ollama.Model,
+		"model":  "CoahGPT One",
 	})
 }
